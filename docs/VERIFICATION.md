@@ -1,5 +1,33 @@
 # Verification · v0.1.0
 
+## macOS 点击崩溃修复（2026-11-12）
+
+基于 main `8f81b41c0742c085b2ab21c68c9d2159a9f5c6af` 的本地修复。
+
+已定位到输入组件的确定性缺陷：空输入框绘制的是占位文字，但原生字符位置查询断言
+缓存布局文字必须等于实际输入；空输入时该断言必然失败。GPUI 0.2.2 的 macOS
+`characterIndexForPoint:` 通过 `extern "C"` 回调调用这一方法，panic 可终止进程。
+普通编辑和 IME 编辑还会留下旧布局，重绘前点击可能得到不属于当前文本的字节偏移。
+
+修复将空输入的字符位置视为 0，拒绝旧布局与非法 UTF-8 边界，并在普通编辑、IME 编辑和
+清空输入时失效缓存。无法取得当前布局时，鼠标保留当前游标；原生查询返回无结果。
+
+本次在 Linux 云环境验证：
+
+- 新增 7 项输入位置回归测试通过，覆盖占位文字、重绘前普通/IME 编辑、Unicode 边界、末尾游标和框外查询。
+- 以旧断言逻辑运行相同纯函数测试，7 项中 5 项失败，包括空占位文字的断言失败；修复后全部通过。
+- `cargo fmt --all -- --check`、Python 语法检查通过。
+- `cargo test --locked --no-default-features`：原有 19 项核心和子进程测试通过。
+- `cargo check --locked --all-targets`、`cargo clippy --locked --all-targets -- -D warnings` 通过。
+- `cargo test --locked --all-targets`：共 26 项测试通过（19 项原有测试 + 7 项新增测试）。
+- 桌面可执行文件编译、链接和 `--help` 冒烟通过。
+
+本地使用缓存依赖并加 `--offline`；Linux 链接沿用下文说明的临时库链接名。
+测试覆盖输入位置判定逻辑，不等同于 macOS 原生事件或完整 GUI 交互测试。
+**没有可用 Mac，尚未验证用户机器上的实际点击、IME 或崩溃堆栈。**
+修复后的三平台 CI 结果以对应提交的 Actions run 为准。
+建议 Mac 回归：打开后点击空输入框及其他按钮；输入、删除中文和 emoji；使用 IME；发送后再次点击清空的输入框。
+
 ## 持续集成（新增）
 
 三平台自动验证由 [Cross-platform CI](https://github.com/smithlee200001/le-agent/actions/workflows/ci.yml) 执行，

@@ -194,7 +194,7 @@ impl TextInput {
 
         let (Some(bounds), Some(line)) = (self.last_bounds.as_ref(), self.last_layout.as_ref())
         else {
-            return 0;
+            return self.cursor_offset();
         };
         if position.y < bounds.top() {
             return 0;
@@ -202,7 +202,10 @@ impl TextInput {
         if position.y > bounds.bottom() {
             return self.content.len();
         }
-        line.closest_index_for_x(position.x - bounds.left())
+        index_for_current_text(&self.content, &line.text, || {
+            Some(line.closest_index_for_x(position.x - bounds.left()))
+        })
+        .unwrap_or_else(|| self.cursor_offset())
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
@@ -271,13 +274,17 @@ impl TextInput {
             .unwrap_or(self.content.len())
     }
 
+    fn invalidate_layout(&mut self) {
+        self.last_layout = None;
+        self.last_bounds = None;
+    }
+
     pub fn reset(&mut self) {
         self.content = "".into();
         self.selected_range = 0..0;
         self.selection_reversed = false;
         self.marked_range = None;
-        self.last_layout = None;
-        self.last_bounds = None;
+        self.invalidate_layout();
         self.is_selecting = false;
         self.scroll_x = px(0.);
     }
@@ -341,6 +348,7 @@ impl EntityInputHandler for TextInput {
         self.selected_range = range.start + new_text.len()..range.start + new_text.len();
         self.marked_range.take();
         self.selection_reversed = false;
+        self.invalidate_layout();
         cx.notify();
     }
 
@@ -385,6 +393,7 @@ impl EntityInputHandler for TextInput {
             })
             .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
 
+        self.invalidate_layout();
         cx.notify();
     }
 
@@ -396,6 +405,9 @@ impl EntityInputHandler for TextInput {
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
         let last_layout = self.last_layout.as_ref()?;
+        if !self.content.is_empty() && last_layout.text != self.content {
+            return None;
+        }
         let range = self.range_from_utf16(&range_utf16);
         Some(Bounds::from_corners(
             point(
@@ -418,8 +430,9 @@ impl EntityInputHandler for TextInput {
         let local_x = point.x - self.last_bounds?.left();
         let last_layout = self.last_layout.as_ref()?;
 
-        assert_eq!(last_layout.text, self.content);
-        let utf8_index = last_layout.index_for_x(local_x)?;
+        let utf8_index = index_for_current_text(&self.content, &last_layout.text, || {
+            last_layout.index_for_x(local_x)
+        })?;
         Some(self.offset_to_utf16(utf8_index))
     }
 }
@@ -678,4 +691,75 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("end", End, Some("TextInput")),
         KeyBinding::new("ctrl-cmd-space", ShowCharacterPalette, Some("TextInput")),
     ]);
+}
+
+// Native text services can query geometry before the next paint. Keep indices
+// tied to the exact text that produced the layout, not merely to its length.
+fn index_for_current_text(
+    content: &str,
+    layout_text: &str,
+    index: impl FnOnce() -> Option<usize>,
+) -> Option<usize> {
+    // Empty input is painted using a placeholder, which has no editable indices.
+    if content.is_empty() {
+        return Some(0);
+    }
+    // macOS may ask between an edit and its repaint. A panic here crosses the
+    // native input callback and can abort the application.
+    if layout_text != content {
+        return None;
+    }
+    index().filter(|&index| content.is_char_boundary(index))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::index_for_current_text;
+
+    #[test]
+    fn native_hit_test_of_empty_placeholder_returns_zero() {
+        assert_eq!(
+            index_for_current_text("", "Describe a coding task…", || {
+                panic!("A placeholder is not editable content")
+            }),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn native_hit_test_before_repaint_rejects_old_text() {
+        assert_eq!(
+            index_for_current_text("new text", "old text", || Some(3)),
+            None
+        );
+    }
+
+    #[test]
+    fn mouse_hit_test_does_not_reuse_ascii_index_for_unicode() {
+        assert_eq!(index_for_current_text("é", "abc", || Some(1)), None);
+    }
+
+    #[test]
+    fn ime_hit_test_before_repaint_rejects_old_composition() {
+        assert_eq!(index_for_current_text("你好", "你", || Some(0)), None);
+    }
+
+    #[test]
+    fn fresh_unicode_indices_are_valid_byte_boundaries() {
+        let text = "A😀中";
+        let byte_index = index_for_current_text(text, text, || Some(5)).unwrap();
+        assert_eq!(text[..byte_index].encode_utf16().count(), 3);
+        assert_eq!(index_for_current_text(text, text, || Some(2)), None);
+        assert_eq!(index_for_current_text(text, text, || Some(99)), None);
+    }
+
+    #[test]
+    fn fresh_mouse_hit_test_can_place_cursor_at_end() {
+        assert_eq!(index_for_current_text("你好", "你好", || Some(6)), Some(6));
+    }
+
+    #[test]
+    fn native_hit_test_outside_line_keeps_none() {
+        assert_eq!(index_for_current_text("hello", "hello", || None), None);
+    }
 }
