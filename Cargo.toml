@@ -1,0 +1,27 @@
+[package]
+name = "coding-agent-desktop"
+version = "0.1.0"
+edition = "2024"
+description = "A minimal GPUI desktop client for Codex App Server"
+license = "Apache-2.0"
+
+[features]
+default = ["desktop"]
+desktop = ["dep:gpui", "dep:unicode-segmentation"]
+
+[dependencies]
+async-channel = "2.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "process", "io-util", "sync", "time", "macros"] }
+gpui = { version = "=0.2.2", optional = true, default-features = false, features = ["x11", "wayland", "windows-manifest"] }
+unicode-segmentation = { version = "1.12", optional = true }
+
+[[bin]]
+name = "coding-agent-desktop"
+path = "src/main.rs"
+required-features = ["desktop"]
+
+[[bin]]
+name = "agent-smoke"
+path = "src/bin/smoke.rs"
