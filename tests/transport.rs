@@ -1,4 +1,3 @@
-#![cfg(unix)]
 use coding_agent_desktop::{
     engine::{Command, Config, Controller},
     state::{AppState, Event},
@@ -7,11 +6,25 @@ use std::{
     path::PathBuf,
     time::{Duration, Instant},
 };
+fn mock_config(workspace: PathBuf) -> Config {
+    let mut config = Config::new(workspace);
+    // Windows does not execute Python shebangs. Use an explicit interpreter on
+    // every platform, with an override for CI and local virtual environments.
+    config.executable = std::env::var_os("PYTHON")
+        .unwrap_or_else(|| if cfg!(windows) { "python" } else { "python3" }.into())
+        .into();
+    config.executable_args = vec![
+        "-X".into(),
+        "utf8".into(),
+        "-u".into(),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/mock_app_server.py")
+            .into_os_string(),
+    ];
+    config
+}
 fn start() -> Controller {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let mut config = Config::new(root.clone());
-    config.executable = root.join("tests/mock_app_server.py");
-    Controller::spawn(config).unwrap()
+    Controller::spawn(mock_config(PathBuf::from(env!("CARGO_MANIFEST_DIR")))).unwrap()
 }
 fn until(controller: &Controller, state: &mut AppState, condition: impl Fn(&AppState) -> bool) {
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -164,9 +177,7 @@ fn dropping_controller_allows_eof_cleanup_and_reaps_child() {
     ));
     std::fs::create_dir(&dir).unwrap();
     std::fs::write(dir.join("record_cleanup"), b"yes").unwrap();
-    let mut config = Config::new(dir.clone());
-    config.executable = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/mock_app_server.py");
-    let controller = Controller::spawn(config).unwrap();
+    let controller = Controller::spawn(mock_config(dir.clone())).unwrap();
     let mut state = AppState::default();
     until(&controller, &mut state, |s| s.connected);
     drop(controller);

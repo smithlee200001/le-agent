@@ -1,5 +1,15 @@
 # Verification · v0.1.0
 
+## 持续集成（新增）
+
+三平台自动验证由 [Cross-platform CI](https://github.com/smithlee200001/le-agent/actions/workflows/ci.yml) 执行，
+最新结果以对应提交的 Actions run 为准。Linux、macOS、Windows 均执行 19 项核心/子进程测试，
+以及完整桌面 targets 的 check、Clippy、test、原生链接和 `--help` 冒烟测试。
+Windows 的 transport 测试使用显式 Python 解释器，不依赖 Unix shebang，也不再条件跳过。
+此流程不覆盖图形交互、真实 Codex 模型任务、签名或安装包。
+
+以下保留 v0.1.0 原始交付时的验证记录，其“未验证”条目描述当时状态。
+
 验证日期：2026-11-12。执行环境：Linux x86_64 云容器，无 DISPLAY/Wayland 图形会话。
 Rust 1.99.1；GPUI 0.2.2；Codex CLI 0.167.0-alpha.4。完整依赖版本见 Cargo.lock。
 

@@ -4,7 +4,7 @@ use crate::{
     state::{Approval, Event},
 };
 use serde_json::{Value, json};
-use std::{collections::HashMap, path::PathBuf, time::Duration};
+use std::{collections::HashMap, ffi::OsString, path::PathBuf, time::Duration};
 use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{ChildStdin, Command as ProcessCommand},
@@ -17,6 +17,8 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(45);
 #[derive(Clone, Debug)]
 pub struct Config {
     pub executable: PathBuf,
+    /// Arguments passed before `app-server`, for example a Python mock script.
+    pub executable_args: Vec<OsString>,
     pub workspace: PathBuf,
     pub model: Option<String>,
     pub resume: Option<String>,
@@ -26,6 +28,7 @@ impl Config {
     pub fn new(workspace: PathBuf) -> Self {
         Self {
             executable: "codex".into(),
+            executable_args: Vec::new(),
             workspace,
             model: None,
             resume: None,
@@ -425,6 +428,7 @@ async fn run(
 ) -> Result<(), String> {
     let mut command = ProcessCommand::new(&config.executable);
     command
+        .args(&config.executable_args)
         .arg("app-server")
         .current_dir(&config.workspace)
         .stdin(std::process::Stdio::piped())

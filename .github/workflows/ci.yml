@@ -1,0 +1,106 @@
+name: Cross-platform CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  CARGO_BUILD_JOBS: '2'
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_PROFILE_TEST_DEBUG: '0'
+  RUST_BACKTRACE: '1'
+
+jobs:
+  build-and-test:
+    name: Build and test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Install Python for transport tests
+        id: python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.13'
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: '1.99.1'
+          components: rustfmt, clippy
+
+      - name: Install Linux desktop dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential pkg-config libxcb1-dev libxkbcommon-dev \
+            libxkbcommon-x11-dev libwayland-dev libfontconfig1-dev \
+            libfreetype6-dev libssl-dev libvulkan-dev
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check Python syntax
+        run: python -m py_compile tests/mock_app_server.py scripts/check_protocol.py
+
+      - name: Test headless core and transport
+        env:
+          PYTHON: ${{ steps.python.outputs.python-path }}
+        run: cargo test --locked --no-default-features
+
+      - name: Check all desktop targets
+        run: cargo check --locked --all-targets
+
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Test all desktop targets
+        env:
+          PYTHON: ${{ steps.python.outputs.python-path }}
+        run: cargo test --locked --all-targets
+
+      - name: Build native desktop application
+        run: cargo build --locked --bin coding-agent-desktop
+
+      - name: Smoke-test native executable
+        run: |
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            ./target/debug/coding-agent-desktop.exe --help
+          else
+            ./target/debug/coding-agent-desktop --help
+          fi
+
+      - name: Upload native executable
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: coding-agent-desktop-${{ runner.os }}-${{ runner.arch }}
+          path: |
+            target/debug/coding-agent-desktop
+            target/debug/coding-agent-desktop.exe
+          if-no-files-found: error
+          retention-days: 7

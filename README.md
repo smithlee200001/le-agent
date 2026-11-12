@@ -1,5 +1,7 @@
 # Coding Agent Desktop · v0.1.0
 
+[![Cross-platform CI](https://github.com/smithlee200001/le-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/smithlee200001/le-agent/actions/workflows/ci.yml)
+
 独立的 **Rust + GPUI** 桌面 Coding Agent 最小实现，以 **Codex App Server** 为执行后端。
 不是 TreeLens 的补丁，不依赖原项目，不含 Git 推送或发布步骤。
 
@@ -50,7 +52,7 @@ Ctrl/⌘ + Enter 发送；Esc 中断；审批卡片显示服务端原始上下�
 - **macOS**：需要 Xcode Command Line Tools；GPUI 使用系统图形后端。
 - **Linux**：需要 X11/Wayland 桌面和可用 GPU/Vulkan 驱动。Debian/Ubuntu 常见构建依赖：
   `build-essential pkg-config libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libfontconfig1-dev libfreetype6-dev libssl-dev libvulkan-dev`。
-- **Windows**：此 MVP 没有完成 Windows 编译和 UI 验证，请勿把跨平台依赖声明当作支持承诺。
+- **Windows**：需要 Visual Studio 的“使用 C++ 的桌面开发”工作负载和 Windows SDK，使用 Rust MSVC 工具链。CI 会原生编译和测试；真实窗口、IME、剪贴板和 Codex 账号闭环仍需在桌面上验收。
 
 GPUI 固定为 crates.io **0.2.2**，交付了完整 `Cargo.lock`。必须使用 `--locked`。
 锁文件将 `libc` 固定在 **0.2.186**，避免旧 `xattr` 传递依赖与移除 `ENOATTR` 的新 libc 不兼容。
@@ -86,6 +88,19 @@ tests/mock_app_server.py    严格 stdio 模拟服务端
 docs/ARCHITECTURE.md 架构、协议与扩展点
 docs/VERIFICATION.md 本次实际验证结果和限制
 ```
+
+## 持续集成
+
+[Cross-platform CI](https://github.com/smithlee200001/le-agent/actions/workflows/ci.yml)
+在每次 push、pull request 和手动触发时并行运行 Linux、macOS、Windows 原生 runner。
+固定 Rust 1.99.1 和 Cargo.lock，执行格式检查、Python 语法检查、headless 核心/子进程测试、
+全部桌面 targets 检查/测试、Clippy、桌面可执行文件编译与 `--help` 冒烟测试。
+Windows 不再跳过 transport 测试；三平台都通过显式 Python 解释器启动模拟后端。
+本地可通过 `PYTHON` 环境变量指定解释器路径；未设置时 Unix 使用 `python3`，Windows 使用 `python`。
+
+成功的运行会保留 7 天未签名的开发版二进制 artifact（按 OS/架构命名），不是安装包。
+Linux/macOS 从 ZIP 解压后如丢失执行位，可运行 `chmod +x coding-agent-desktop`。
+CI 不需要 Codex 账号或模型密钥，不启动图形窗口、不调用真实模型；绿色 CI 只覆盖上述自动检查。
 
 ## 开发检查
 
