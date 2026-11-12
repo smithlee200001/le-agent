@@ -49,7 +49,7 @@ Ctrl/⌘ + Enter 发送；Esc 中断；审批卡片显示服务端原始上下�
 
 ### 平台依赖
 
-- **macOS**：需要 Xcode Command Line Tools；GPUI 使用系统图形后端。
+- **macOS**：需要完整 Xcode 及其 Metal 编译工具（`xcrun metal`、`xcrun metallib`）；仅安装 Command Line Tools 不足以构建 GPUI 的 Metal shaders。GPUI 使用系统图形后端。
 - **Linux**：需要 X11/Wayland 桌面和可用 GPU/Vulkan 驱动。Debian/Ubuntu 常见构建依赖：
   `build-essential pkg-config libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libfontconfig1-dev libfreetype6-dev libssl-dev libvulkan-dev`。
 - **Windows**：需要 Visual Studio 的“使用 C++ 的桌面开发”工作负载和 Windows SDK，使用 Rust MSVC 工具链。CI 会原生编译和测试；真实窗口、IME、剪贴板和 Codex 账号闭环仍需在桌面上验收。
