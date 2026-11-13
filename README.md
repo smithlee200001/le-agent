@@ -1,13 +1,12 @@
-# Coding Agent Desktop · v0.1.0
+# le-agent
 
 [![Cross-platform CI](https://github.com/smithlee200001/le-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/smithlee200001/le-agent/actions/workflows/ci.yml)
 
-独立的 **Rust + GPUI** 桌面 Coding Agent 最小实现，以 **Codex App Server** 为执行后端。
-不是 TreeLens 的补丁，不依赖原项目，不含 Git 推送或发布步骤。
+基于 **Rust + GPUI** 的桌面 Coding Agent，以 **Codex App Server** 为执行后端。
 
-## 实现了什么
+## 功能
 
-- 真正的 GPUI 原生窗口：会话、流式回答、命令输出、统一 diff、审批卡片、诊断日志。
+- GPUI 原生窗口：会话、流式回答、命令输出、统一 diff、审批卡片、诊断日志。
 - 独立子进程 `codex app-server`；后台 Tokio runtime 处理 stdio JSONL，UI 不直接做进程 I/O。
 - `initialize` → `initialized` → `thread/start` 或 `thread/resume` → `turn/start`。
 - 双向 RPC：分别识别 response、notification 和 **服务端带 ID 的 request**。
@@ -20,7 +19,7 @@
 
 ## 快速运行
 
-准备：Rust stable（本次实际使用 1.99.1）、Codex CLI，以及可用的桌面图形会话。
+准备：Rust 1.99.1（与 CI 一致）、Codex CLI，以及可用的桌面图形会话。
 先按 [Codex 官方安装说明](https://developers.openai.com/codex/cli/) 安装并完成登录：
 
 ```sh
@@ -52,9 +51,9 @@ Ctrl/⌘ + Enter 发送；Esc 中断；审批卡片显示服务端原始上下�
 - **macOS**：需要完整 Xcode 及其 Metal 编译工具（`xcrun metal`、`xcrun metallib`）；仅安装 Command Line Tools 不足以构建 GPUI 的 Metal shaders。GPUI 使用系统图形后端。
 - **Linux**：需要 X11/Wayland 桌面和可用 GPU/Vulkan 驱动。Debian/Ubuntu 常见构建依赖：
   `build-essential pkg-config libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libfontconfig1-dev libfreetype6-dev libssl-dev libvulkan-dev`。
-- **Windows**：需要 Visual Studio 的“使用 C++ 的桌面开发”工作负载和 Windows SDK，使用 Rust MSVC 工具链。CI 会原生编译和测试；真实窗口、IME、剪贴板和 Codex 账号闭环仍需在桌面上验收。
+- **Windows**：需要 Visual Studio 的“使用 C++ 的桌面开发”工作负载和 Windows SDK，使用 Rust MSVC 工具链。
 
-GPUI 固定为 crates.io **0.2.2**，交付了完整 `Cargo.lock`。必须使用 `--locked`。
+GPUI 固定为 crates.io **0.2.2**，依赖版本由 `Cargo.lock` 管理。构建时使用 `--locked`。
 锁文件将 `libc` 固定在 **0.2.186**，避免旧 `xattr` 传递依赖与移除 `ENOATTR` 的新 libc 不兼容。
 不要不经测试就运行 `cargo update`。
 
@@ -86,7 +85,7 @@ scripts/check_protocol.py    用本机 CLI 生成的 schema 校验 payload
 tests/transport.rs   与独立模拟进程的端到端测试
 tests/mock_app_server.py    严格 stdio 模拟服务端
 docs/ARCHITECTURE.md 架构、协议与扩展点
-docs/VERIFICATION.md 本次实际验证结果和限制
+docs/VERIFICATION.md 验证记录和测试范围
 ```
 
 ## 持续集成
@@ -95,7 +94,7 @@ docs/VERIFICATION.md 本次实际验证结果和限制
 在每次 push、pull request 和手动触发时并行运行 Linux、macOS、Windows 原生 runner。
 固定 Rust 1.99.1 和 Cargo.lock，执行格式检查、Python 语法检查、headless 核心/子进程测试、
 全部桌面 targets 检查/测试、Clippy、桌面可执行文件编译与 `--help` 冒烟测试。
-Windows 不再跳过 transport 测试；三平台都通过显式 Python 解释器启动模拟后端。
+三平台通过显式 Python 解释器启动模拟后端，运行 transport 测试。
 本地可通过 `PYTHON` 环境变量指定解释器路径；未设置时 Unix 使用 `python3`，Windows 使用 `python`。
 
 成功的运行会保留 7 天未签名的开发版二进制 artifact（按 OS/架构命名），不是安装包。
@@ -131,11 +130,11 @@ cargo run --locked --bin coding-agent-desktop -- \
 需要 Python 3。发送普通文字会看到模拟审批、流式回答和 diff，**不会执行真实命令或修改工作区**。
 发送 `interrupt` 可演示中断按钮。模拟器仅用于开发测试。
 
-## 明确未实现
+## 当前限制
 
-这不是 Codex Desktop 或 Zed 的完整克隆。尚无多工作区/线程列表、分页历史加载、自动重连、账号登录 UI、模型选择器、多行编辑器、Markdown/代码高亮、文件树、交互式终端、结构化工具问答、图片输入、文件附件、diff 撤销和打包签名。
+尚不支持多工作区/线程列表、分页历史加载、自动重连、账号登录 UI、模型选择器、多行编辑器、Markdown/代码高亮、文件树、交互式终端、结构化工具问答、图片输入、文件附件、diff 撤销和打包签名。
 
 `--resume` 会显示后端内联返回的历史；新版协议可能只给一部分历史。缺失的分页历史不等于没有历史，本版不会请求历史分页。
 对话最多保留 2000 个显示项目，单项目文本最多 256 KiB；diff 同样有显示上限。它们只限制 UI，不修改 Codex 保存的历史。
 
-本次可复现的验证边界请先读 [VERIFICATION.md](docs/VERIFICATION.md)。
+详细验证记录见 [VERIFICATION.md](docs/VERIFICATION.md)。
