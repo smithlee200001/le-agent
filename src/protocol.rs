@@ -1,6 +1,7 @@
 //! Codex App Server uses JSON-RPC semantics with no `jsonrpc` wire member.
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::HashSet;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -97,6 +98,65 @@ pub fn allows_decision(params: &Value, accept: bool) -> bool {
     choices
         .iter()
         .any(|choice| choice.as_str() == Some(if accept { "accept" } else { "decline" }))
+}
+
+/// Share turn identity rules between transport bookkeeping and the UI reducer.
+/// Remember completed turns even while the next turn's identity is still unknown.
+#[derive(Default)]
+pub(crate) struct TurnScope {
+    completed: HashSet<String>,
+}
+impl TurnScope {
+    pub(crate) fn restore(&mut self, thread: &Value, active: &mut Option<String>) {
+        self.completed.clear();
+        *active = None;
+        if let Some(turns) = thread["turns"].as_array() {
+            for turn in turns {
+                if let Some(id) = turn["id"].as_str() {
+                    if turn["status"] == "inProgress" {
+                        *active = Some(id.into());
+                    } else {
+                        self.completed.insert(id.into());
+                    }
+                }
+            }
+        }
+    }
+    pub(crate) fn identify(&self, active: &mut Option<String>, id: &str) -> bool {
+        if self.completed.contains(id) || active.as_deref().is_some_and(|current| current != id) {
+            return false;
+        }
+        *active = Some(id.into());
+        true
+    }
+    pub(crate) fn notification(
+        &mut self,
+        active: &mut Option<String>,
+        method: &str,
+        params: &Value,
+    ) -> bool {
+        let scoped = method.starts_with("item/")
+            || method.starts_with("turn/")
+            || (method == "error" && params.get("turnId").is_some());
+        if !scoped {
+            return true;
+        }
+        let id = if matches!(method, "turn/started" | "turn/completed") {
+            params["turn"]["id"].as_str()
+        } else {
+            params["turnId"].as_str()
+        };
+        let Some(id) = id else {
+            return false;
+        };
+        if !self.identify(active, id) {
+            return false;
+        }
+        if method == "turn/completed" {
+            self.completed.insert(id.into());
+        }
+        true
+    }
 }
 
 #[cfg(test)]

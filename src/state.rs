@@ -1,5 +1,5 @@
 //! UI-independent state reducer. Transport and all process I/O stay off the UI thread.
-use crate::protocol::RequestId;
+use crate::protocol::{RequestId, TurnScope};
 use serde_json::Value;
 
 const MAX_ITEMS: usize = 2000;
@@ -25,6 +25,8 @@ pub enum Event {
     ApprovalRequested(Approval),
     ApprovalResolved(RequestId),
     Busy(bool),
+    Cancelling,
+    TurnIdentified(String),
     Log(String),
     Error(String),
     Disconnected(String),
@@ -34,6 +36,8 @@ pub struct AppState {
     pub status: String,
     pub connected: bool,
     pub busy: bool,
+    pub cancelling: bool,
+    turn_scope: TurnScope,
     pub thread_id: Option<String>,
     pub turn_id: Option<String>,
     pub items: Vec<ItemView>,
@@ -62,7 +66,10 @@ impl AppState {
             Event::ThreadOpened { thread, resumed } => {
                 self.thread_id = thread["id"].as_str().map(str::to_owned);
                 self.connected = true;
-                self.status = "Ready".into();
+                self.turn_scope.restore(&thread, &mut self.turn_id);
+                self.busy = self.turn_id.is_some();
+                self.cancelling = false;
+                self.status = self.activity_status().into();
                 if let Some(turns) = thread["turns"].as_array() {
                     for turn in turns {
                         if let Some(items) = turn["items"].as_array() {
@@ -78,20 +85,38 @@ impl AppState {
             }
             Event::Busy(busy) => {
                 self.busy = busy;
-                self.status = if busy { "Working" } else { "Ready" }.into();
+                if !busy {
+                    self.cancelling = false;
+                    self.turn_id = None;
+                    self.approvals.clear();
+                }
+                self.status = self.activity_status().into();
                 if busy {
                     self.last_error = None;
+                }
+            }
+            Event::Cancelling => {
+                if self.busy {
+                    self.cancelling = true;
+                    self.status = "Cancelling…".into();
+                }
+            }
+            Event::TurnIdentified(id) => {
+                let previous_turn = self.turn_id.clone();
+                if self.turn_scope.identify(&mut self.turn_id, &id) && previous_turn != self.turn_id
+                {
+                    self.diff.clear();
                 }
             }
             Event::ApprovalRequested(approval) => {
                 if !self.approvals.iter().any(|a| a.id == approval.id) {
                     self.approvals.push(approval);
                 }
-                self.status = "Approval required".into();
+                self.status = self.activity_status().into();
             }
             Event::ApprovalResolved(id) => {
                 self.approvals.retain(|a| a.id != id);
-                self.status = if self.busy { "Working" } else { "Ready" }.into();
+                self.status = self.activity_status().into();
             }
             Event::Log(log) => self.log(log),
             Event::Error(error) => {
@@ -101,12 +126,24 @@ impl AppState {
             Event::Disconnected(reason) => {
                 self.connected = false;
                 self.busy = false;
+                self.cancelling = false;
                 self.turn_id = None;
                 self.approvals.clear();
                 self.status = "Disconnected".into();
                 self.log(reason);
             }
             Event::Notification { method, params } => self.notification(&method, &params),
+        }
+    }
+    fn activity_status(&self) -> &'static str {
+        if self.cancelling {
+            "Cancelling…"
+        } else if !self.approvals.is_empty() {
+            "Approval required"
+        } else if self.busy {
+            "Working"
+        } else {
+            "Ready"
         }
     }
     fn log(&mut self, mut message: String) {
@@ -122,20 +159,25 @@ impl AppState {
         {
             return;
         }
+        let previous_turn = self.turn_id.clone();
+        if !self
+            .turn_scope
+            .notification(&mut self.turn_id, method, params)
+        {
+            return;
+        }
+        if previous_turn != self.turn_id {
+            self.diff.clear();
+        }
         match method {
             "turn/started" => {
                 self.turn_id = params["turn"]["id"].as_str().map(str::to_owned);
                 self.busy = true;
-                self.status = "Working".into();
-                self.diff.clear();
+                self.status = self.activity_status().into();
             }
             "turn/completed" => {
-                if let Some(id) = params["turn"]["id"].as_str()
-                    && self.turn_id.as_deref().is_some_and(|active| active != id)
-                {
-                    return;
-                }
                 self.busy = false;
+                self.cancelling = false;
                 self.turn_id = None;
                 self.approvals.clear();
                 self.status = format!(
@@ -245,18 +287,18 @@ mod tests {
         notify(
             &mut s,
             "item/agentMessage/delta",
-            json!({"itemId":"i","delta":"你"}),
+            json!({"turnId":"u","itemId":"i","delta":"你"}),
         );
         notify(
             &mut s,
             "item/agentMessage/delta",
-            json!({"itemId":"i","delta":"好"}),
+            json!({"turnId":"u","itemId":"i","delta":"好"}),
         );
         assert_eq!(s.items[0].text, "你好");
         notify(
             &mut s,
             "item/completed",
-            json!({"item":{"id":"i","type":"agentMessage","text":"你好!"}}),
+            json!({"turnId":"u","item":{"id":"i","type":"agentMessage","text":"你好!"}}),
         );
         assert_eq!(s.items.len(), 1);
         assert_eq!(s.items[0].text, "你好!");

@@ -28,6 +28,24 @@ def response(request, result):
     send({"id": request["id"], "result": result})
 
 
+def stale_frames(tid):
+    for method in ("item/started", "item/completed", "item/agentMessage/delta",
+                   "item/commandExecution/outputDelta", "turn/diff/updated",
+                   "turn/completed", "turn/started"):
+        send({"method": method, "params": {"threadId": "t1", "turnId": tid,
+              "itemId": "history", "delta": "stale", "diff": "stale diff",
+              "item": {"id": "history", "type": "agentMessage", "text": "stale"},
+              "turn": {"id": tid, "status": "completed"}}})
+
+
+def gate(name, tid):
+    send({"id": name, "method": "item/fileChange/requestApproval",
+          "params": {"threadId": "t1", "turnId": tid, "itemId": name,
+                     "availableDecisions": ["decline"]}})
+    request = receive()
+    assert request == {"id": name, "result": {"decision": "decline"}}, request
+
+
 request = receive()
 assert request["method"] == "initialize"
 response(request, {"userAgent": "mock/1"})
@@ -50,6 +68,28 @@ while True:
     if prompt == "malformed":
         print("not json", flush=True)
         continue
+    if prompt.startswith("start-gated"):
+        gate("start-gate", tid)
+        if prompt == "start-gated-completed":
+            send({"method": "turn/completed", "params": {"threadId": "t1",
+                  "turn": {"id": tid, "status": "completed"}}})
+            response(request, {"turn": {"id": tid, "status": "completed"}})
+            gate("completed-gate", tid)
+            continue
+        if prompt == "start-gated-failure":
+            send({"id": request["id"], "error": {"code": -1, "message": "start failed"}})
+            continue
+        # Only the RPC response supplies the identity: cancellation must still work.
+        response(request, {"turn": {"id": tid, "status": "inProgress"}})
+        interrupt = receive()
+        assert interrupt["method"] == "turn/interrupt"
+        assert interrupt["params"] == {"threadId": "t1", "turnId": tid}
+        response(interrupt, {})
+        send({"method": "turn/completed", "params": {"threadId": "t1",
+              "turn": {"id": tid, "status": "interrupted"}}})
+        continue
+    if prompt == "stale-b":
+        stale_frames(f"turn-{turn - 1}")
     send(
         {
             "method": "turn/started",
@@ -57,6 +97,30 @@ while True:
         }
     )
     response(request, {"turn": {"id": tid, "status": "inProgress"}})
+    if prompt == "history-a":
+        send({"method": "item/completed", "params": {"threadId": "t1", "turnId": tid,
+              "item": {"id": "history", "type": "agentMessage", "text": "confirmed"}}})
+        send({"method": "turn/completed", "params": {"threadId": "t1",
+              "turn": {"id": tid, "status": "completed"}}})
+        continue
+    if prompt == "stale-b":
+        stale_frames(f"turn-{turn - 1}")
+        send({"method": "item/completed", "params": {"threadId": "t1", "turnId": tid,
+              "item": {"id": "marker", "type": "agentMessage", "text": "B ready"}}})
+    if prompt.startswith("interrupt-gated"):
+        request = receive()
+        assert request["method"] == "turn/interrupt"
+        assert request["params"] == {"threadId": "t1", "turnId": tid}
+        response(request, {})
+        # Explicit wire gate: the test sends another Interrupt after observing ACK,
+        # then declines this gate. A duplicate interrupt must not precede the reply.
+        gate("terminal-gate", tid)
+        if prompt == "interrupt-gated-disconnect":
+            sys.exit(17)
+        status = {"interrupt-gated-completed": "completed", "interrupt-gated-failed": "failed"}.get(prompt, "interrupted")
+        send({"method": "turn/completed", "params": {"threadId": "t1",
+              "turn": {"id": tid, "status": status, "items": []}}})
+        continue
     if prompt == "duplicate-approval":
         for command in ("echo safe", "echo changed"):
             send(
@@ -96,6 +160,7 @@ while True:
                 "method": "item/completed",
                 "params": {
                     "threadId": "t1",
+                    "turnId": tid,
                     "item": {
                         "id": "marker",
                         "type": "agentMessage",
@@ -104,7 +169,7 @@ while True:
                 },
             }
         )
-    if prompt in ("interrupt", "child-approval"):
+    if prompt in ("interrupt", "child-approval", "stale-b"):
         request = receive()
         assert request["method"] == "turn/interrupt"
         assert request["params"] == {"threadId": "t1", "turnId": tid}
@@ -170,6 +235,7 @@ while True:
                 "method": "item/commandExecution/outputDelta",
                 "params": {
                     "threadId": "t1",
+                    "turnId": tid,
                     "itemId": f"cmd-{turn}",
                     "delta": "hello\n",
                 },
@@ -178,7 +244,7 @@ while True:
         send(
             {
                 "method": "item/agentMessage/delta",
-                "params": {"threadId": "t1", "itemId": f"a-{turn}", "delta": "你好"},
+                "params": {"threadId": "t1", "turnId": tid, "itemId": f"a-{turn}", "delta": "你好"},
             }
         )
         send(
@@ -186,6 +252,7 @@ while True:
                 "method": "item/completed",
                 "params": {
                     "threadId": "t1",
+                    "turnId": tid,
                     "item": {
                         "id": f"a-{turn}",
                         "type": "agentMessage",
