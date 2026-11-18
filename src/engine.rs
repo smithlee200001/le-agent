@@ -154,6 +154,8 @@ struct Session {
     busy: bool,
     ready: bool,
     interrupt_queued: bool,
+    interrupt_requested: bool,
+    turn_scope: protocol::TurnScope,
 }
 impl Session {
     async fn write(&mut self, value: Value) -> Result<(), String> {
@@ -209,6 +211,7 @@ impl Session {
                 }
                 self.busy = true;
                 self.interrupt_queued = false;
+                self.interrupt_requested = false;
                 emit(events, Event::Busy(true)).await?;
                 self.request(
                     "turn/start",
@@ -217,18 +220,20 @@ impl Session {
                 .await?;
             }
             Command::Interrupt => {
-                if let (Some(thread), Some(turn)) = (&self.thread, &self.turn) {
-                    if !self.pending.values().any(|p| p.method == "turn/interrupt") {
+                if self.busy && !self.interrupt_requested {
+                    self.interrupt_requested = true;
+                    emit(events, Event::Cancelling).await?;
+                    if let (Some(thread), Some(turn)) = (&self.thread, &self.turn) {
                         self.request("turn/interrupt", json!({"threadId":thread,"turnId":turn}))
                             .await?;
+                    } else {
+                        self.interrupt_queued = true;
+                        emit(
+                            events,
+                            Event::Log("Interrupt queued until the turn ID arrives.".into()),
+                        )
+                        .await?;
                     }
-                } else if self.busy {
-                    self.interrupt_queued = true;
-                    emit(
-                        events,
-                        Event::Log("Interrupt queued until the turn ID arrives.".into()),
-                    )
-                    .await?;
                 }
             }
             Command::Decide { id, accept } => {
@@ -284,6 +289,10 @@ impl Session {
                         }
                         if pending.method == "turn/start" {
                             self.busy = false;
+                            self.turn = None;
+                            self.interrupt_queued = false;
+                            self.interrupt_requested = false;
+                            self.approvals.clear();
                             emit(events, Event::Busy(false)).await?;
                         }
                         emit(
@@ -319,6 +328,8 @@ impl Session {
                             .as_str()
                             .ok_or("Thread response is missing thread.id")?
                             .to_owned();
+                        self.turn_scope.restore(&value["thread"], &mut self.turn);
+                        self.busy = self.turn.is_some();
                         self.thread = Some(id);
                         self.ready = true;
                         emit(
@@ -332,8 +343,12 @@ impl Session {
                     }
                     "turn/start" => {
                         // Notifications may arrive before the response. Never resurrect a completed turn.
-                        if self.busy && self.turn.is_none() {
-                            self.turn = value["turn"]["id"].as_str().map(str::to_owned);
+                        if self.busy
+                            && self.turn.is_none()
+                            && let Some(id) = value["turn"]["id"].as_str()
+                            && self.turn_scope.identify(&mut self.turn, id)
+                        {
+                            emit(events, Event::TurnIdentified(id.into())).await?;
                         }
                         if self.busy && self.turn.is_none() {
                             return Err("Turn response is missing turn.id".into());
@@ -389,18 +404,22 @@ impl Session {
                     .as_str()
                     .is_none_or(|id| self.thread.as_deref().is_none_or(|active| id == active));
                 if for_thread {
+                    if !self
+                        .turn_scope
+                        .notification(&mut self.turn, &method, &params)
+                    {
+                        return Ok(());
+                    }
                     match method.as_str() {
                         "turn/started" => {
                             self.turn = params["turn"]["id"].as_str().map(str::to_owned);
                             self.busy = true;
                         }
-                        "turn/completed"
-                            if params["turn"]["id"].as_str().is_none_or(|id| {
-                                self.turn.as_deref().is_none_or(|active| id == active)
-                            }) =>
-                        {
+                        "turn/completed" => {
                             self.turn = None;
                             self.busy = false;
+                            self.interrupt_queued = false;
+                            self.interrupt_requested = false;
                             self.approvals.clear();
                         }
                         _ => {}
@@ -451,6 +470,8 @@ async fn run(
         busy: false,
         ready: false,
         interrupt_queued: false,
+        interrupt_requested: false,
+        turn_scope: protocol::TurnScope::default(),
     };
     let stdout = child.stdout.take().ok_or("Missing child stdout")?;
     let stderr = child.stderr.take().ok_or("Missing child stderr")?;

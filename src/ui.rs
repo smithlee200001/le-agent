@@ -1,7 +1,7 @@
 //! Small native GPUI shell. All protocol and subprocess work lives in `engine`.
 use crate::{
     engine::{Command, Config, Controller},
-    state::AppState,
+    state::{AppState, Event},
     text_input::{self, TextInput},
 };
 use gpui::{prelude::*, *};
@@ -171,9 +171,11 @@ impl AgentView {
         cx.notify();
     }
     fn interrupt(&mut self, _: &Interrupt, _: &mut Window, cx: &mut Context<Self>) {
-        if self.state.busy {
+        if self.state.busy && !self.state.cancelling {
             if let Err(error) = self.controller.send(Command::Interrupt) {
                 self.state.last_error = Some(error);
+            } else {
+                self.state.apply(Event::Cancelling);
             }
             cx.notify();
         }
@@ -183,7 +185,7 @@ impl AgentView {
 impl Render for AgentView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let can_send = self.can_send();
-        let busy = self.state.busy;
+        let can_interrupt = self.state.busy && !self.state.cancelling;
         div().size_full().flex().flex_col().bg(rgb(0x11161d)).text_color(rgb(0xe3e8ef))
             .font_family("sans-serif").text_sm().key_context("Agent")
             .on_action(cx.listener(Self::send)).on_action(cx.listener(Self::interrupt))
@@ -249,7 +251,7 @@ impl Render for AgentView {
                 .child(div().flex().justify_between().items_center()
                     .child(div().text_color(rgb(0x9ba9bd)).child("Ctrl/⌘ + Enter to send · Esc to interrupt · Single-line composer"))
                     .child(div().flex().gap_2()
-                        .child(button("interrupt", "Interrupt", busy).on_click(cx.listener(|v, _, w, cx| v.interrupt(&Interrupt, w, cx))))
+                        .child(button("interrupt", if self.state.cancelling { "Cancelling…" } else { "Interrupt" }, can_interrupt).on_click(cx.listener(|v, _, w, cx| v.interrupt(&Interrupt, w, cx))))
                         .child(button("send", "Send task", can_send).on_click(cx.listener(|v, _, w, cx| v.send(&SendPrompt, w, cx)))))))
     }
 }

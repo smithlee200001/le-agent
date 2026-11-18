@@ -205,3 +205,262 @@ fn duplicate_unresolved_approval_id_closes_connection_without_approval() {
     );
     assert!(state.approvals.is_empty());
 }
+
+#[test]
+fn interrupt_after_ack_before_terminal_is_not_sent_twice() {
+    let controller = start();
+    let mut state = AppState::default();
+    until(&controller, &mut state, |s| s.connected);
+    controller
+        .send(Command::SendPrompt("interrupt-gated".into()))
+        .unwrap();
+    until(&controller, &mut state, |s| s.turn_id.is_some());
+    controller.send(Command::Interrupt).unwrap();
+    until(&controller, &mut state, |s| {
+        !s.approvals.is_empty() && s.logs.iter().any(|l| l.contains("awaiting turn/completed"))
+    });
+    assert!(state.busy, "ACK must not finish the turn");
+    assert!(state.cancelling);
+    assert_eq!(state.status, "Cancelling…");
+    controller.send(Command::Interrupt).unwrap();
+    controller
+        .send(Command::Decide {
+            id: state.approvals[0].id.clone(),
+            accept: false,
+        })
+        .unwrap();
+    until(&controller, &mut state, |s| s.status == "Turn interrupted");
+}
+
+#[test]
+fn old_turn_events_cannot_mutate_new_turn_or_confirmed_history() {
+    use serde_json::json;
+    let mut state = AppState::default();
+    let notify = |state: &mut AppState, method: &str, params| {
+        state.apply(Event::Notification {
+            method: method.into(),
+            params,
+        })
+    };
+    notify(
+        &mut state,
+        "turn/started",
+        json!({"threadId":"t", "turn":{"id":"a"}}),
+    );
+    notify(
+        &mut state,
+        "item/completed",
+        json!({"threadId":"t", "turnId":"a", "item":{"id":"history", "type":"agentMessage", "text":"confirmed"}}),
+    );
+    notify(
+        &mut state,
+        "turn/completed",
+        json!({"threadId":"t", "turn":{"id":"a", "status":"completed"}}),
+    );
+    state.apply(Event::Busy(true));
+    // Old frames can also arrive before B's identity is known.
+    notify(
+        &mut state,
+        "item/agentMessage/delta",
+        json!({"threadId":"t", "turnId":"a", "itemId":"history", "delta":"stale"}),
+    );
+    notify(
+        &mut state,
+        "turn/started",
+        json!({"threadId":"t", "turn":{"id":"b"}}),
+    );
+    notify(
+        &mut state,
+        "turn/diff/updated",
+        json!({"threadId":"t", "turnId":"b", "diff":"new diff"}),
+    );
+    for method in [
+        "item/started",
+        "item/completed",
+        "item/agentMessage/delta",
+        "item/commandExecution/outputDelta",
+        "turn/diff/updated",
+        "turn/completed",
+        "turn/started",
+    ] {
+        notify(
+            &mut state,
+            method,
+            json!({"threadId":"t", "turnId":"a", "itemId":"history", "delta":"stale", "diff":"old diff", "item":{"id":"history", "type":"agentMessage", "text":"stale"}, "turn":{"id":"a", "status":"completed"}}),
+        );
+    }
+    assert_eq!(state.items[0].text, "confirmed");
+    assert_eq!(state.turn_id.as_deref(), Some("b"));
+    assert!(state.busy);
+    assert_eq!(state.diff, "new diff");
+}
+
+#[test]
+fn transport_ignores_retired_turns_before_and_after_new_identity() {
+    let controller = start();
+    let mut state = AppState::default();
+    until(&controller, &mut state, |s| s.connected);
+    controller
+        .send(Command::SendPrompt("history-a".into()))
+        .unwrap();
+    until(&controller, &mut state, |s| s.status == "Turn completed");
+    controller
+        .send(Command::SendPrompt("stale-b".into()))
+        .unwrap();
+    until(&controller, &mut state, |s| {
+        s.items.iter().any(|i| i.text == "B ready")
+    });
+    assert_eq!(state.items[0].text, "confirmed");
+    assert_eq!(state.turn_id.as_deref(), Some("turn-2"));
+    assert!(state.busy);
+    assert!(state.diff.is_empty());
+    controller.send(Command::Interrupt).unwrap();
+    until(&controller, &mut state, |s| s.status == "Turn interrupted");
+}
+
+#[test]
+fn cancellation_before_identity_and_start_failure_are_cleaned_up() {
+    for prompt in [
+        "start-gated",
+        "start-gated-failure",
+        "start-gated-completed",
+    ] {
+        let controller = start();
+        let mut state = AppState::default();
+        until(&controller, &mut state, |s| s.connected);
+        controller.send(Command::SendPrompt(prompt.into())).unwrap();
+        until(&controller, &mut state, |s| !s.approvals.is_empty());
+        assert!(state.turn_id.is_none());
+        controller.send(Command::Interrupt).unwrap();
+        until(&controller, &mut state, |s| s.cancelling);
+        controller.send(Command::Interrupt).unwrap();
+        controller
+            .send(Command::Decide {
+                id: state.approvals[0].id.clone(),
+                accept: false,
+            })
+            .unwrap();
+        until(&controller, &mut state, |s| !s.busy);
+        if prompt == "start-gated-completed" {
+            // This gate is emitted after the start response, so the next prompt
+            // cannot race the worker removing its pending turn/start request.
+            until(&controller, &mut state, |s| !s.approvals.is_empty());
+            controller
+                .send(Command::Decide {
+                    id: state.approvals[0].id.clone(),
+                    accept: false,
+                })
+                .unwrap();
+            until(&controller, &mut state, |s| s.approvals.is_empty());
+        }
+        assert!(!state.cancelling);
+        assert!(state.turn_id.is_none());
+        assert!(state.approvals.is_empty());
+        if prompt.ends_with("failure") {
+            assert!(state.last_error.as_ref().unwrap().contains("start failed"));
+        }
+        // No queued cancellation leaks into the next turn.
+        controller
+            .send(Command::SendPrompt("history-a".into()))
+            .unwrap();
+        until(&controller, &mut state, |s| {
+            s.items.iter().any(|i| i.text == "confirmed")
+        });
+    }
+}
+
+#[test]
+fn cancellation_clears_on_normal_completion_failure_and_disconnect() {
+    for (prompt, status) in [
+        ("interrupt-gated-completed", "Turn completed"),
+        ("interrupt-gated-failed", "Turn failed"),
+        ("interrupt-gated-disconnect", "Disconnected"),
+    ] {
+        let controller = start();
+        let mut state = AppState::default();
+        until(&controller, &mut state, |s| s.connected);
+        controller.send(Command::SendPrompt(prompt.into())).unwrap();
+        until(&controller, &mut state, |s| s.turn_id.is_some());
+        controller.send(Command::Interrupt).unwrap();
+        until(&controller, &mut state, |s| {
+            !s.approvals.is_empty() && s.logs.iter().any(|l| l.contains("awaiting turn/completed"))
+        });
+        assert!(state.busy && state.cancelling);
+        controller
+            .send(Command::Decide {
+                id: state.approvals[0].id.clone(),
+                accept: false,
+            })
+            .unwrap();
+        until(&controller, &mut state, |s| s.status == status);
+        assert!(!state.busy && !state.cancelling);
+        assert!(state.turn_id.is_none() && state.approvals.is_empty());
+        if state.connected {
+            controller.send(Command::Interrupt).unwrap();
+            controller
+                .send(Command::SendPrompt("history-a".into()))
+                .unwrap();
+            until(&controller, &mut state, |s| {
+                s.items.iter().any(|i| i.text == "confirmed")
+            });
+            assert!(state.connected);
+        }
+    }
+}
+
+#[test]
+fn resumed_history_and_current_turn_out_of_order_events_are_preserved() {
+    use serde_json::json;
+    let mut state = AppState::default();
+    state.apply(Event::ThreadOpened { resumed: true, thread: json!({"id":"t", "turns":[
+        {"id":"a", "status":"completed", "items":[{"id":"history", "type":"agentMessage", "text":"confirmed"}]},
+        {"id":"b", "status":"inProgress", "items":[]}
+    ]}) });
+    let notify = |state: &mut AppState, method: &str, params| {
+        state.apply(Event::Notification {
+            method: method.into(),
+            params,
+        })
+    };
+    notify(
+        &mut state,
+        "item/agentMessage/delta",
+        json!({"threadId":"t", "turnId":"a", "itemId":"history", "delta":"stale"}),
+    );
+    notify(
+        &mut state,
+        "item/agentMessage/delta",
+        json!({"threadId":"t", "turnId":"b", "itemId":"current", "delta":"early"}),
+    );
+    notify(
+        &mut state,
+        "turn/diff/updated",
+        json!({"threadId":"t", "turnId":"b", "diff":"early diff"}),
+    );
+    notify(
+        &mut state,
+        "turn/started",
+        json!({"threadId":"t", "turn":{"id":"b"}}),
+    );
+    assert_eq!(state.items[0].text, "confirmed");
+    assert_eq!(state.items[1].text, "early");
+    assert_eq!(state.diff, "early diff");
+    assert!(state.busy);
+    notify(
+        &mut state,
+        "item/completed",
+        json!({"threadId":"t", "turnId":"b", "item":{"id":"current", "type":"agentMessage", "text":"final"}}),
+    );
+    notify(
+        &mut state,
+        "turn/completed",
+        json!({"threadId":"t", "turn":{"id":"b", "status":"completed"}}),
+    );
+    notify(
+        &mut state,
+        "turn/started",
+        json!({"threadId":"t", "turn":{"id":"b"}}),
+    );
+    assert!(!state.busy);
+    assert_eq!(state.items[1].text, "final");
+}
