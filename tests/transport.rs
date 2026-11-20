@@ -106,8 +106,9 @@ fn crash_disconnects_and_clears_execution() {
     controller
         .send(Command::SendPrompt("crash".into()))
         .unwrap();
-    until(&controller, &mut state, |s| s.status == "Disconnected");
+    until(&controller, &mut state, |s| !s.connected);
     assert!(!state.busy);
+    assert_eq!(state.status, "Disconnected · Turn outcome unknown");
 }
 #[test]
 fn malformed_frame_is_terminal_not_silently_ignored() {
@@ -117,7 +118,8 @@ fn malformed_frame_is_terminal_not_silently_ignored() {
     controller
         .send(Command::SendPrompt("malformed".into()))
         .unwrap();
-    until(&controller, &mut state, |s| s.status == "Disconnected");
+    until(&controller, &mut state, |s| !s.connected);
+    assert_eq!(state.status, "Disconnected · Turn outcome unknown");
     assert!(state.last_error.unwrap().contains("Malformed"));
 }
 #[test]
@@ -196,7 +198,7 @@ fn duplicate_unresolved_approval_id_closes_connection_without_approval() {
     controller
         .send(Command::SendPrompt("duplicate-approval".into()))
         .unwrap();
-    until(&controller, &mut state, |s| s.status == "Disconnected");
+    until(&controller, &mut state, |s| !s.connected);
     assert!(
         state
             .last_error
@@ -374,7 +376,10 @@ fn cancellation_clears_on_normal_completion_failure_and_disconnect() {
     for (prompt, status) in [
         ("interrupt-gated-completed", "Turn completed"),
         ("interrupt-gated-failed", "Turn failed"),
-        ("interrupt-gated-disconnect", "Disconnected"),
+        (
+            "interrupt-gated-disconnect",
+            "Disconnected · Turn outcome unknown",
+        ),
     ] {
         let controller = start();
         let mut state = AppState::default();
@@ -463,4 +468,134 @@ fn resumed_history_and_current_turn_out_of_order_events_are_preserved() {
     );
     assert!(!state.busy);
     assert_eq!(state.items[1].text, "final");
+}
+
+#[test]
+fn interrupt_rejection_unlocks_a_deliberate_retry_without_finishing_turn() {
+    let controller = start();
+    let mut state = AppState::default();
+    until(&controller, &mut state, |s| s.connected);
+    controller
+        .send(Command::SendPrompt("interrupt-rejected".into()))
+        .unwrap();
+    until(&controller, &mut state, |s| s.turn_id.is_some());
+    controller.send(Command::Interrupt).unwrap();
+    until(&controller, &mut state, |s| !s.approvals.is_empty());
+    assert!(state.connected && state.busy && !state.cancelling);
+    assert_eq!(state.status, "Approval required");
+    assert_eq!(state.turn_id.as_deref(), Some("turn-1"));
+    assert!(
+        state
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("interrupt rejected")
+    );
+    controller
+        .send(Command::Decide {
+            id: state.approvals[0].id.clone(),
+            accept: false,
+        })
+        .unwrap();
+    until(&controller, &mut state, |s| s.status == "Working");
+    controller.send(Command::Interrupt).unwrap();
+    until(&controller, &mut state, |s| s.status == "Turn interrupted");
+}
+
+#[test]
+fn late_interrupt_rejection_does_not_unlock_newer_turn() {
+    let controller = start();
+    let mut state = AppState::default();
+    until(&controller, &mut state, |s| s.connected);
+    controller
+        .send(Command::SendPrompt("interrupt-late-a".into()))
+        .unwrap();
+    until(&controller, &mut state, |s| {
+        s.turn_id.as_deref() == Some("turn-1")
+    });
+    controller.send(Command::Interrupt).unwrap();
+    until(&controller, &mut state, |s| s.status == "Turn interrupted");
+    controller
+        .send(Command::SendPrompt("interrupt-late-b".into()))
+        .unwrap();
+    until(&controller, &mut state, |s| {
+        s.turn_id.as_deref() == Some("turn-2")
+    });
+    controller.send(Command::Interrupt).unwrap();
+    until(&controller, &mut state, |s| !s.approvals.is_empty());
+    assert!(state.busy && state.cancelling && state.last_error.is_none());
+    assert_eq!(state.status, "Cancelling…");
+    controller.send(Command::Interrupt).unwrap();
+    controller
+        .send(Command::Decide {
+            id: state.approvals[0].id.clone(),
+            accept: false,
+        })
+        .unwrap();
+    until(&controller, &mut state, |s| s.status == "Turn interrupted");
+}
+
+#[test]
+fn exit_preserves_only_complete_terminal_frames_and_final_text() {
+    for (prompt, expected) in [
+        ("terminal-before-exit", "Disconnected · Turn completed"),
+        (
+            "truncated-before-exit",
+            "Disconnected · Turn outcome unknown",
+        ),
+    ] {
+        // Exercise the race between reading the last frames and reaping a child.
+        for _ in 0..8 {
+            let controller = start();
+            let mut state = AppState::default();
+            until(&controller, &mut state, |s| s.connected);
+            controller.send(Command::SendPrompt(prompt.into())).unwrap();
+            until(&controller, &mut state, |s| !s.connected);
+            assert_eq!(state.status, expected);
+            assert!(state.items.iter().any(|item| item.text == "final text"));
+            assert!(!state.busy && !state.cancelling);
+            assert!(state.turn_id.is_none() && state.approvals.is_empty());
+        }
+    }
+}
+
+#[test]
+fn process_exit_drain_is_bounded_even_when_descendant_keeps_stdout_open() {
+    let controller = start();
+    let mut state = AppState::default();
+    until(&controller, &mut state, |s| s.connected);
+    controller
+        .send(Command::SendPrompt("terminal-with-inherited-stdout".into()))
+        .unwrap();
+    until(&controller, &mut state, |s| !s.connected);
+    assert_eq!(state.status, "Disconnected · Turn completed");
+    assert!(
+        state
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("Timed out draining")
+    );
+}
+
+#[test]
+fn failed_queued_interrupt_write_does_not_hide_a_buffered_completion() {
+    let controller = start();
+    let mut state = AppState::default();
+    until(&controller, &mut state, |s| s.connected);
+    controller
+        .send(Command::SendPrompt("start-gated-stdin-closed".into()))
+        .unwrap();
+    until(&controller, &mut state, |s| !s.approvals.is_empty());
+    controller.send(Command::Interrupt).unwrap();
+    until(&controller, &mut state, |s| s.cancelling);
+    controller
+        .send(Command::Decide {
+            id: state.approvals[0].id.clone(),
+            accept: false,
+        })
+        .unwrap();
+    until(&controller, &mut state, |s| !s.connected);
+    assert_eq!(state.status, "Disconnected · Turn completed");
+    assert!(!state.cancelling && state.approvals.is_empty());
 }

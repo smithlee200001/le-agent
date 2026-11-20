@@ -14,6 +14,7 @@ use tokio::{
 
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 const RPC_TIMEOUT: Duration = Duration::from_secs(45);
+const EXIT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 #[derive(Clone, Debug)]
 pub struct Config {
     pub executable: PathBuf,
@@ -142,10 +143,12 @@ async fn read_frame<R: AsyncBufRead + Unpin>(reader: &mut R) -> Result<Option<Ve
 }
 struct Pending {
     method: String,
+    interrupt_turn: Option<String>,
     deadline: Instant,
 }
 struct Session {
     stdin: ChildStdin,
+    write_failed: bool,
     next_id: i64,
     pending: HashMap<RequestId, Pending>,
     approvals: HashMap<RequestId, Approval>,
@@ -161,22 +164,30 @@ impl Session {
     async fn write(&mut self, value: Value) -> Result<(), String> {
         let mut bytes = serde_json::to_vec(&value).map_err(|e| e.to_string())?;
         bytes.push(b'\n');
-        timeout(Duration::from_secs(5), async {
+        let result = timeout(Duration::from_secs(5), async {
             self.stdin.write_all(&bytes).await?;
             self.stdin.flush().await
         })
         .await
-        .map_err(|_| "App server stdin timed out".to_owned())?
-        .map_err(|e| e.to_string())
+        .map_err(|_| "App server stdin timed out".to_owned())
+        .and_then(|result| result.map_err(|error| error.to_string()));
+        if result.is_err() {
+            self.write_failed = true;
+        }
+        result
     }
     async fn request(&mut self, method: &str, params: Value) -> Result<(), String> {
         let id = RequestId::Number(self.next_id);
         self.next_id += 1;
+        let interrupt_turn = (method == "turn/interrupt")
+            .then(|| params["turnId"].as_str().map(str::to_owned))
+            .flatten();
         self.write(protocol::request(&id, method, params)).await?;
         self.pending.insert(
             id,
             Pending {
                 method: method.into(),
+                interrupt_turn,
                 deadline: Instant::now() + RPC_TIMEOUT,
             },
         );
@@ -281,6 +292,13 @@ impl Session {
                     .await?;
                     return Ok(());
                 };
+                if pending.method == "turn/interrupt"
+                    && (!self.busy
+                        || pending.interrupt_turn.is_none()
+                        || pending.interrupt_turn != self.turn)
+                {
+                    return Ok(());
+                }
                 let value = match result {
                     Ok(value) => value,
                     Err(error) => {
@@ -294,6 +312,16 @@ impl Session {
                             self.interrupt_requested = false;
                             self.approvals.clear();
                             emit(events, Event::Busy(false)).await?;
+                        }
+                        if pending.method == "turn/interrupt" {
+                            self.interrupt_requested = false;
+                            self.interrupt_queued = false;
+                            emit(
+                                events,
+                                Event::InterruptRejected(format!("turn/interrupt failed: {error}")),
+                            )
+                            .await?;
+                            return Ok(());
                         }
                         emit(
                             events,
@@ -393,39 +421,7 @@ impl Session {
                 }
             }
             Message::Notification { method, params } => {
-                // RPC request IDs are connection-wide, including approvals from child threads.
-                if method == "serverRequest/resolved"
-                    && let Ok(id) = serde_json::from_value::<RequestId>(params["requestId"].clone())
-                {
-                    self.approvals.remove(&id);
-                    emit(events, Event::ApprovalResolved(id)).await?;
-                }
-                let for_thread = params["threadId"]
-                    .as_str()
-                    .is_none_or(|id| self.thread.as_deref().is_none_or(|active| id == active));
-                if for_thread {
-                    if !self
-                        .turn_scope
-                        .notification(&mut self.turn, &method, &params)
-                    {
-                        return Ok(());
-                    }
-                    match method.as_str() {
-                        "turn/started" => {
-                            self.turn = params["turn"]["id"].as_str().map(str::to_owned);
-                            self.busy = true;
-                        }
-                        "turn/completed" => {
-                            self.turn = None;
-                            self.busy = false;
-                            self.interrupt_queued = false;
-                            self.interrupt_requested = false;
-                            self.approvals.clear();
-                        }
-                        _ => {}
-                    }
-                }
-                emit(events, Event::Notification { method, params }).await?;
+                self.notification(method, params, events).await?;
             }
         }
         if self.interrupt_queued
@@ -439,7 +435,84 @@ impl Session {
         }
         Ok(())
     }
+    async fn notification(
+        &mut self,
+        method: String,
+        params: Value,
+        events: &async_channel::Sender<Event>,
+    ) -> Result<(), String> {
+        // RPC request IDs are connection-wide, including approvals from child threads.
+        if method == "serverRequest/resolved"
+            && let Ok(id) = serde_json::from_value::<RequestId>(params["requestId"].clone())
+        {
+            self.approvals.remove(&id);
+            emit(events, Event::ApprovalResolved(id)).await?;
+        }
+        let for_thread = params["threadId"]
+            .as_str()
+            .is_none_or(|id| self.thread.as_deref().is_none_or(|active| id == active));
+        if for_thread {
+            if !self
+                .turn_scope
+                .notification(&mut self.turn, &method, &params)
+            {
+                return Ok(());
+            }
+            match method.as_str() {
+                "turn/started" => {
+                    self.turn = params["turn"]["id"].as_str().map(str::to_owned);
+                    self.busy = true;
+                }
+                "turn/completed" => {
+                    let finished = self.turn.take();
+                    // A terminal event settles the turn even if the interrupt RPC has not replied.
+                    self.pending.retain(|_, pending| {
+                        pending.interrupt_turn.is_none() || pending.interrupt_turn != finished
+                    });
+                    self.busy = false;
+                    self.interrupt_queued = false;
+                    self.interrupt_requested = false;
+                    self.approvals.clear();
+                }
+                _ => {}
+            }
+        }
+        emit(events, Event::Notification { method, params }).await?;
+        Ok(())
+    }
 }
+
+fn decode_frame(line: &[u8]) -> Result<Option<Message>, String> {
+    if line.iter().all(u8::is_ascii_whitespace) {
+        return Ok(None);
+    }
+    protocol::decode(line)
+        .map(Some)
+        .map_err(|e| format!("Malformed app-server JSONL: {e}"))
+}
+
+type WireFrame = Result<Option<Vec<u8>>, String>;
+
+async fn drain_after_exit(
+    session: &mut Session,
+    wire_rx: &mut mpsc::Receiver<WireFrame>,
+    events: &async_channel::Sender<Event>,
+) -> Result<(), String> {
+    // No more writes after child exit or a stdin failure. Only apply notifications;
+    // in particular, deliver terminal turn events before reporting disconnection.
+    timeout(EXIT_DRAIN_TIMEOUT, async {
+        while let Some(frame) = wire_rx.recv().await {
+            let Some(line) = frame? else { break };
+            if let Some(Message::Notification { method, params }) = decode_frame(&line)? {
+                session.notification(method, params, events).await?;
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_| "Timed out draining app server stdout".to_owned())?
+}
+
 async fn run(
     config: Config,
     mut commands: mpsc::Receiver<Command>,
@@ -462,6 +535,7 @@ async fn run(
     })?;
     let mut session = Session {
         stdin: child.stdin.take().ok_or("Missing child stdin")?,
+        write_failed: false,
         next_id: 1,
         pending: HashMap::new(),
         approvals: HashMap::new(),
@@ -507,6 +581,7 @@ async fn run(
             }
         }
     });
+    let mut child_exited = false;
     let result=async {
         session.request("initialize",protocol::initialize_params()).await?;
         let mut timer=tokio::time::interval(Duration::from_millis(250));
@@ -516,14 +591,19 @@ async fn run(
                 line=wire_rx.recv()=>{
                     match line {
                         Some(Ok(Some(line)))=>{
-                            if line.iter().all(u8::is_ascii_whitespace) {continue;}
-                            session.incoming(protocol::decode(&line).map_err(|e|format!("Malformed app-server JSONL: {e}"))?,&config,&events).await?;
+                            if let Some(message) = decode_frame(&line)? {
+                                session.incoming(message,&config,&events).await?;
+                            }
                         }
                         Some(Err(error))=>return Err(error),
                         Some(Ok(None)) | None=>return Err("App server closed stdout".into()),
                     }
                 }
-                status=child.wait()=>return Err(format!("App server exited: {}",status.map_err(|e|e.to_string())?)),
+                status=child.wait()=>{
+                    let status = status.map_err(|e| e.to_string())?;
+                    child_exited = true;
+                    return Err(format!("App server exited: {status}"));
+                },
                 _=timer.tick()=>{
                     if let Some(pending)=session.pending.values().find(|pending|pending.deadline<=Instant::now()) {return Err(format!("{} timed out. Connection closed; outcome may be uncertain. No automatic retry.",pending.method));}
                     if events.is_closed() {break;}
@@ -532,6 +612,17 @@ async fn run(
         }
         Ok(())
     }.await;
+    let result = if let Err(reason) = result {
+        if (child_exited || session.write_failed)
+            && let Err(error) = drain_after_exit(&mut session, &mut wire_rx, &events).await
+        {
+            Err(format!("{reason}; {error}"))
+        } else {
+            Err(reason)
+        }
+    } else {
+        result
+    };
     reader.abort();
     stderr_reader.abort();
     // Closing stdin allows Codex to flush history and clean up its own tool children.

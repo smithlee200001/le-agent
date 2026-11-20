@@ -4,6 +4,7 @@
 import json
 import sys
 import os
+import subprocess
 import time
 
 
@@ -56,6 +57,7 @@ assert request["params"]["approvalPolicy"] == "on-request"
 assert request["params"]["approvalsReviewer"] == "user"
 response(request, {"thread": {"id": "t1", "turns": []}})
 turn = 0
+late_interrupt = None
 while True:
     request = receive()
     assert request["method"] == "turn/start", request
@@ -79,6 +81,15 @@ while True:
         if prompt == "start-gated-failure":
             send({"id": request["id"], "error": {"code": -1, "message": "start failed"}})
             continue
+        if prompt == "start-gated-stdin-closed":
+            # The queued interrupt's first write hits a closed pipe before child.wait can fire.
+            os.close(sys.stdin.fileno())
+            response(request, {"turn": {"id": tid, "status": "inProgress"}})
+            time.sleep(0.1)
+            send({"method": "turn/completed", "params": {"threadId": "t1",
+                  "turn": {"id": tid, "status": "completed"}}})
+            time.sleep(0.1)
+            sys.exit(17)
         # Only the RPC response supplies the identity: cancellation must still work.
         response(request, {"turn": {"id": tid, "status": "inProgress"}})
         interrupt = receive()
@@ -97,6 +108,43 @@ while True:
         }
     )
     response(request, {"turn": {"id": tid, "status": "inProgress"}})
+    if prompt in ("interrupt-rejected", "interrupt-late-a", "interrupt-late-b"):
+        interrupt = receive()
+        assert interrupt["method"] == "turn/interrupt"
+        assert interrupt["params"] == {"threadId": "t1", "turnId": tid}
+        if prompt == "interrupt-late-a":
+            late_interrupt = interrupt
+        elif prompt == "interrupt-late-b":
+            send({"id": late_interrupt["id"], "error": {"code": -1, "message": "old turn"}})
+            response(interrupt, {})
+            gate("late-b-gate", tid)
+        else:
+            send({"id": interrupt["id"], "error": {"code": -1, "message": "interrupt rejected"}})
+            # The test must explicitly clear this gate before retrying. A silent retry fails it.
+            gate("after-rejection", tid)
+            retry = receive()
+            assert retry["id"] != interrupt["id"] and retry["method"] == "turn/interrupt"
+            assert retry["params"] == interrupt["params"]
+            response(retry, {})
+        send({"method": "turn/completed", "params": {"threadId": "t1",
+              "turn": {"id": tid, "status": "interrupted"}}})
+        continue
+    if prompt in ("terminal-before-exit", "truncated-before-exit", "terminal-with-inherited-stdout"):
+        send({"method": "item/completed", "params": {"threadId": "t1", "turnId": tid,
+              "item": {"id": "final", "type": "agentMessage", "text": "final text"}}})
+        terminal = {"method": "turn/completed", "params": {"threadId": "t1",
+                    "turn": {"id": tid, "status": "completed"}}}
+        if prompt != "truncated-before-exit":
+            send(terminal)
+            if prompt == "terminal-with-inherited-stdout":
+                # A passive descendant keeps the pipe open beyond the supervisor's deadline.
+                subprocess.Popen([sys.executable, "-c", "import time; time.sleep(3)"],
+                                 stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            # Complete-looking JSON without the required JSONL delimiter isn't a frame.
+            sys.stdout.write(json.dumps(terminal))
+            sys.stdout.flush()
+        sys.exit(17)
     if prompt == "history-a":
         send({"method": "item/completed", "params": {"threadId": "t1", "turnId": tid,
               "item": {"id": "history", "type": "agentMessage", "text": "confirmed"}}})
