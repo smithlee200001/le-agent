@@ -26,6 +26,7 @@ pub enum Event {
     ApprovalResolved(RequestId),
     Busy(bool),
     Cancelling,
+    InterruptRejected(String),
     TurnIdentified(String),
     Log(String),
     Error(String),
@@ -38,6 +39,7 @@ pub struct AppState {
     pub busy: bool,
     pub cancelling: bool,
     turn_scope: TurnScope,
+    last_turn_status: Option<String>,
     pub thread_id: Option<String>,
     pub turn_id: Option<String>,
     pub items: Vec<ItemView>,
@@ -67,6 +69,7 @@ impl AppState {
                 self.thread_id = thread["id"].as_str().map(str::to_owned);
                 self.connected = true;
                 self.turn_scope.restore(&thread, &mut self.turn_id);
+                self.last_turn_status = None;
                 self.busy = self.turn_id.is_some();
                 self.cancelling = false;
                 self.status = self.activity_status().into();
@@ -92,6 +95,7 @@ impl AppState {
                 }
                 self.status = self.activity_status().into();
                 if busy {
+                    self.last_turn_status = None;
                     self.last_error = None;
                 }
             }
@@ -99,6 +103,14 @@ impl AppState {
                 if self.busy {
                     self.cancelling = true;
                     self.status = "Cancelling…".into();
+                }
+            }
+            Event::InterruptRejected(error) => {
+                if self.busy && self.cancelling {
+                    self.cancelling = false;
+                    self.status = self.activity_status().into();
+                    self.last_error = Some(error.clone());
+                    self.log(error);
                 }
             }
             Event::TurnIdentified(id) => {
@@ -124,12 +136,18 @@ impl AppState {
                 self.log(error);
             }
             Event::Disconnected(reason) => {
+                self.status = if self.busy {
+                    "Disconnected · Turn outcome unknown".into()
+                } else if let Some(status) = &self.last_turn_status {
+                    format!("Disconnected · {status}")
+                } else {
+                    "Disconnected".into()
+                };
                 self.connected = false;
                 self.busy = false;
                 self.cancelling = false;
                 self.turn_id = None;
                 self.approvals.clear();
-                self.status = "Disconnected".into();
                 self.log(reason);
             }
             Event::Notification { method, params } => self.notification(&method, &params),
@@ -173,6 +191,7 @@ impl AppState {
             "turn/started" => {
                 self.turn_id = params["turn"]["id"].as_str().map(str::to_owned);
                 self.busy = true;
+                self.last_turn_status = None;
                 self.status = self.activity_status().into();
             }
             "turn/completed" => {
@@ -184,8 +203,11 @@ impl AppState {
                     "Turn {}",
                     params["turn"]["status"].as_str().unwrap_or("completed")
                 );
+                self.last_turn_status = Some(self.status.clone());
                 if let Some(error) = params["turn"].get("error").filter(|v| !v.is_null()) {
-                    self.last_error = Some(error.to_string());
+                    let error = error.to_string();
+                    self.last_error = Some(error.clone());
+                    self.log(error);
                 }
             }
             "item/started" | "item/completed" => self.upsert(&params["item"]),

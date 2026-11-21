@@ -11,8 +11,8 @@
 - `initialize` → `initialized` → `thread/start` 或 `thread/resume` → `turn/start`。
 - 双向 RPC：分别识别 response、notification 和 **服务端带 ID 的 request**。
 - 命令/文件变更审批：接受一次或拒绝；保留原始数字/字符串 request ID；不自动审批。
-- `turn/interrupt`，包括在 turn ID 尚未返回时排队取消。收到 `turn/completed` 才结束运行状态。
-- ID 对齐的增量 reducer；恢复已有线程；进程退出/坏 JSON/超时的显式错误。
+- `turn/interrupt` 支持在 turn ID 返回前排队。收到确认回执不代表本轮结束；服务端明确拒绝中断后，当前轮仍在运行，可以手动再试，不会自动重试。
+- ID 对齐的增量 reducer；恢复已有线程；进程退出时最多再读取 1 秒的 stdout，保留已收到的 `turn/completed`，否则把仍在运行的轮次标为结果未知。坏 JSON 和超时显式报错。
 - 有界消息队列、8 MiB 单帧上限、45 秒 RPC 响应超时、5 秒写入超时、重复点击保护。
 - UI 关闭时关闭 stdin，最多等待 2 秒让后端清理，再终止并回收该子进程。
 - 可独立测试的 headless 核心、模拟 App Server、真实 CLI schema 校验脚本。
